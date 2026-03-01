@@ -9,6 +9,8 @@ from services.parser import parse_proposal
 from agents.scoring_agent import score_proposal
 from agents.draft_agent import draft_proposal, draft_proposal_stream
 from services.vector_store import find_similar_grants
+from services.budget_generator import generate_budget
+from services.budget_chatbot import refine_budget
 
 app = FastAPI(title="ImpactLink AI Backend")
 
@@ -27,6 +29,14 @@ class ProposalRequest(BaseModel):
 class DraftRequest(BaseModel):
     proposal: dict
     grant: dict
+
+class BudgetRequest(BaseModel):
+    proposal: dict
+    max_budget: int
+
+class RefineBudgetRequest(BaseModel):
+    current_budget: dict
+    user_request: str
 
 # ── Routes ───────────────────────────────────────────────
 
@@ -47,12 +57,22 @@ async def upload(file: UploadFile = File(...)):
     file_bytes = await file.read()
     proposal = parse_proposal(file_bytes, file.filename)
 
-    scoring, matches = await asyncio.gather(
+    # scoring, matches = await asyncio.gather(
+    #     asyncio.to_thread(score_proposal, proposal),
+    #     asyncio.to_thread(find_similar_grants, proposal, 5),
+    # )
+    scoring, matches, initial_budget = await asyncio.gather(
         asyncio.to_thread(score_proposal, proposal),
         asyncio.to_thread(find_similar_grants, proposal, 5),
+        asyncio.to_thread(generate_budget, proposal, 100000) 
     )
 
-    return { "proposal": proposal, "scoring": scoring, "matches": matches }
+    return { 
+        "proposal": proposal, 
+        "scoring": scoring, 
+        "matches": matches,
+        "budget": initial_budget 
+    }
 
 
 @app.post("/api/match")
@@ -90,3 +110,22 @@ def draft_stream(req: DraftRequest):
             yield chunk
 
     return StreamingResponse(generate(), media_type="text/plain")
+
+@app.post("/api/budget/generate")
+async def generate_new_budget(req: BudgetRequest):
+    """
+    Generates a fresh budget if the user selects a specific grant 
+    with a different award ceiling.
+    """
+    budget = await asyncio.to_thread(generate_budget, req.proposal, req.max_budget)
+    return budget
+
+@app.post("/api/budget/refine")
+async def refine_budget_chat(req: RefineBudgetRequest):
+    """
+    The Chatbot endpoint. Takes the current budget JSON and the 
+    user's text request, returning a re-balanced budget.
+    """
+    # This uses Groq for logical re-allocation
+    updated_budget = await asyncio.to_thread(refine_budget, req.current_budget, req.user_request)
+    return updated_budget

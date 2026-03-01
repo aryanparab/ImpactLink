@@ -1,15 +1,39 @@
 import json
+from pydantic import BaseModel, Field
+from typing import List, Literal
+from langchain_ollama import ChatOllama
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
-from dotenv import load_dotenv
+from config import USE_GROQ, GROQ_API_KEY, LOCAL_LLM_MODEL
 
-load_dotenv()
+# 1. Force the SLM to output the exact types we need
+class ScoringResult(BaseModel):
+    clarity_score: int = Field(description="Score 0-100", ge=0, le=100)
+    impact_score: int = Field(description="Score 0-100", ge=0, le=100)
+    budget_score: int = Field(description="Score 0-100", ge=0, le=100)
+    locality_alignment: int = Field(description="Score 0-100", ge=0, le=100)
+    beneficiary_definition: int = Field(description="Score 0-100", ge=0, le=100)
+    strengths: List[str] = Field(description="3 things the proposal does well")
+    weaknesses: List[str] = Field(description="3 things that could get it rejected")
+    recommendations: List[str] = Field(description="3 specific improvements")
+    funder_readiness: Literal["strong", "moderate", "needs_work"]
 
-llm = ChatGroq(
-    model="llama-3.3-70b-versatile",
-    temperature=0,
-)
-
+# 2. Configure Ollama for JSON and sufficient context
+def get_scoring_llm():
+    if USE_GROQ:
+        return ChatGroq(
+            model="llama-3.3-70b-versatile",
+            temperature=0,
+            groq_api_key=GROQ_API_KEY
+        )
+    else:
+        return ChatOllama(
+            model=LOCAL_LLM_MODEL,
+            temperature=0,
+            format="json", 
+            num_ctx=4096 
+        )
+    
 SCORING_PROMPT = ChatPromptTemplate.from_messages([
     ("system", """You are an expert grant evaluator with 20 years of experience reviewing NGO proposals.
 You understand what funders look for and what makes proposals succeed or fail.
@@ -39,26 +63,32 @@ of historically successful grants to give data-driven scoring."""),
 ])
 
 def score_proposal(proposal: dict) -> dict:
-    """
-    Takes the parsed proposal JSON and returns a scoring analysis.
-    Single LLM call for now — future scope: compare against historical grants DB.
-    """
-    chain = SCORING_PROMPT | llm
+    mode_name = "Groq" if USE_GROQ else "Local Ollama"
+    print(f"⚖️ Scoring proposal via {mode_name}...")
     
-    response = chain.invoke({
-        "proposal_json": json.dumps(proposal, indent=2)
-    })
-
-    content = response.content.strip()
-
-    # Strip markdown fences if present
-    if content.startswith("```"):
-        content = content.split("```")[1]
-        if content.startswith("json"):
-            content = content[4:]
-
-    scored = json.loads(content)
-    scored["agent"] = "scoring_agent_v1"
-    scored["note"] = "Single LLM evaluation. Future: compared against historical successful grants."
-
-    return scored
+    llm = get_scoring_llm()
+    structured_llm = llm.with_structured_output(ScoringResult)
+    chain = SCORING_PROMPT | structured_llm
+    
+    try:
+        # Step 1: LLM Reasoning
+        result = chain.invoke({"proposal_json": json.dumps(proposal, indent=2)})
+        scored = result.model_dump()
+        
+        # Step 2: Deterministic Math (Don't let LLMs do average/weighted math)
+        score_values = [
+            scored["clarity_score"], 
+            scored["impact_score"], 
+            scored["budget_score"], 
+            scored["locality_alignment"], 
+            scored["beneficiary_definition"]
+        ]
+        # Calculate overall score in Python for 100% accuracy
+        scored["overall_score"] = int(sum(score_values) / len(score_values))
+        
+        scored["agent"] = f"scoring_agent_{'groq' if USE_GROQ else 'local'}"
+        return scored
+        
+    except Exception as e:
+        print(f"❌ Scoring Error: {e}")
+        return {"error": "Failed to score proposal", "details": str(e)}

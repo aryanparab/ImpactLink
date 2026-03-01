@@ -2,10 +2,12 @@ import os
 import tempfile
 from typing import List, Optional
 from pydantic import BaseModel, Field
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_groq import ChatGroq
+# Added TextLoader for handling non-PDFs gracefully
+from langchain_community.document_loaders import PyPDFLoader, TextLoader 
 from langchain_core.prompts import ChatPromptTemplate
-
+from langchain_ollama import ChatOllama
+from langchain_groq import ChatGroq
+from config import USE_GROQ, GROQ_API_KEY, LOCAL_LLM_MODEL
 
 # --- Pydantic Model (structured output) ---
 
@@ -23,42 +25,65 @@ class ProposalFeatures(BaseModel):
 
 
 # --- Chain Builder ---
+def get_extraction_llm():
+    if USE_GROQ:
+        return ChatGroq(
+            model="llama-3.3-70b-versatile", 
+            temperature=0, 
+            groq_api_key=GROQ_API_KEY
+        )
+    else:
+        return ChatOllama(
+            model=LOCAL_LLM_MODEL, 
+            temperature=0, 
+            format="json",
+            num_ctx=8192  # Essential for long PDF context
+        )
 
 def build_extraction_chain():
-    llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
+    llm = get_extraction_llm()
     structured_llm = llm.with_structured_output(ProposalFeatures)
 
     prompt = ChatPromptTemplate.from_messages([
-        ("system", """You are an expert grant reviewer. Extract specific metadata from the NGO proposal 
-to help match them with funders. If information is missing, infer from context or leave blank."""),
+        ("system", """You are an expert grant reviewer. Extract metadata from the NGO proposal.
+If information is missing, infer from context or leave blank.
+CRITICAL: Return ONLY a valid JSON object matching the requested schema."""),
         ("user", "Here is the proposal text:\n\n{text}")
     ])
 
     return prompt | structured_llm
 
-
 # --- Main Parse Function (called by FastAPI) ---
 
 def parse_proposal(file_bytes: bytes, filename: str) -> dict:
-    """
-    Accepts raw file bytes from FastAPI upload.
-    Writes to temp file (PyPDFLoader needs a path), extracts, returns dict.
-    """
-    suffix = ".pdf" if filename.endswith(".pdf") else ".txt"
+    is_pdf = filename.lower().endswith(".pdf")
+    suffix = ".pdf" if is_pdf else ".txt"
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(file_bytes)
         tmp_path = tmp.name
 
     try:
-        loader = PyPDFLoader(tmp_path)
+        if is_pdf:
+            loader = PyPDFLoader(tmp_path)
+        else:
+            loader = TextLoader(tmp_path, encoding="utf-8")
+            
         pages = loader.load()
+        # Grab the first 10 pages to balance context and speed
         combined_text = "\n".join([page.page_content for page in pages[:10]])
 
+        mode_name = "Groq" if USE_GROQ else "Local Ollama"
+        print(f"🧠 Extracting features using {mode_name}...")
+        
         chain = build_extraction_chain()
         result = chain.invoke({"text": combined_text})
 
         return result.model_dump()
 
+    except Exception as e:
+        print(f"❌ Extraction Error: {e}")
+        return {"error": "Failed to parse document", "details": str(e)}
     finally:
-        os.unlink(tmp_path)
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)

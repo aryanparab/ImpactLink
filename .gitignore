@@ -6,3 +6,5 @@ chroma_db
 Data/
 __pycache__/
 *.pyc
+*.pyo
+*.pyd

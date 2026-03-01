@@ -4,8 +4,5 @@ venv/
 chroma_db
 .env
 Data/
-impactlink-frontend/node_modules/
-impactlink-frontend/build/
 __pycache__/
 *.pyc
-Data/funding_proposals

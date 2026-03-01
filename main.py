@@ -1,74 +1,92 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from typing import Optional
 import asyncio
 
 from services.parser import parse_proposal
 from agents.scoring_agent import score_proposal
-from agents.similarity_agent import find_similar_grants
+from agents.draft_agent import draft_proposal, draft_proposal_stream
+from services.vector_store import find_similar_grants
 
-app = FastAPI(title="NGO Grant Intelligence Portal")
+app = FastAPI(title="ImpactLink AI Backend")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:3000"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ── Request models ────────────────────────────────────────
+class ProposalRequest(BaseModel):
+    proposal: dict
+    top_k: int = 5
+
+class DraftRequest(BaseModel):
+    proposal: dict
+    grant: dict
+
+# ── Routes ───────────────────────────────────────────────
+
 @app.get("/")
-def health():
-    return {"status": "running", "message": "NGO Grant Portal API"}
+def root():
+    return {"status": "ImpactLink AI backend running"}
 
 
 @app.post("/api/upload")
-async def upload_proposal(file: UploadFile = File(...)):
+async def upload(file: UploadFile = File(...)):
     """
-    Main endpoint. Accepts PDF/DOCX upload.
-    Returns: extracted proposal JSON + scoring + funder matches.
+    Upload PDF → parse + score + match in parallel.
+    Returns: { proposal, scoring, matches }
     """
-    # Validate file type
-    if not file.filename.endswith((".pdf", ".docx", ".txt")):
-        raise HTTPException(status_code=400, detail="Only PDF, DOCX, or TXT files accepted.")
+    if not file.filename.endswith((".pdf", ".docx")):
+        raise HTTPException(400, "Only PDF or DOCX files are supported.")
 
     file_bytes = await file.read()
+    proposal = parse_proposal(file_bytes, file.filename)
 
-    # Step 1: Parse proposal → structured JSON
-    try:
-        proposal = parse_proposal(file_bytes, file.filename)
-    except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Failed to parse proposal: {str(e)}")
+    scoring, matches = await asyncio.gather(
+        asyncio.to_thread(score_proposal, proposal),
+        asyncio.to_thread(find_similar_grants, proposal, 5),
+    )
 
-    # Step 2: Run scoring + similarity in parallel
-    try:
-        scoring_result, funder_matches = await asyncio.gather(
-            asyncio.to_thread(score_proposal, proposal),
-            asyncio.to_thread(find_similar_grants, proposal, 5)
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Agent error: {str(e)}")
-
-    return {
-        "proposal": proposal,
-        "scoring": scoring_result,
-        "funder_matches": funder_matches,
-    }
-
-
-@app.post("/api/score")
-async def score_only(proposal: dict):
-    """Score an already-parsed proposal JSON directly."""
-    try:
-        result = await asyncio.to_thread(score_proposal, proposal)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return { "proposal": proposal, "scoring": scoring, "matches": matches }
 
 
 @app.post("/api/match")
-async def match_only(proposal: dict):
-    """Find funder matches for an already-parsed proposal JSON."""
-    try:
-        result = await asyncio.to_thread(find_similar_grants, proposal, 5)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+def match(req: ProposalRequest):
+    """Get grant matches for an already-parsed proposal."""
+    matches = find_similar_grants(req.proposal, req.top_k)
+    return { "matches": matches }
+
+
+@app.post("/api/score")
+def score(req: ProposalRequest):
+    """Score an already-parsed proposal."""
+    scoring = score_proposal(req.proposal)
+    return { "scoring": scoring }
+
+
+@app.post("/api/draft")
+def draft(req: DraftRequest):
+    """
+    Draft a complete proposal for a specific grant.
+    Non-streaming — returns all sections at once.
+    """
+    result = draft_proposal(req.proposal, req.grant)
+    return result
+
+
+@app.post("/api/draft/stream")
+def draft_stream(req: DraftRequest):
+    """
+    Draft a proposal with streaming — yields each section as it completes.
+    Frontend reads chunks via EventSource / fetch with ReadableStream.
+    """
+    def generate():
+        for chunk in draft_proposal_stream(req.proposal, req.grant):
+            yield chunk
+
+    return StreamingResponse(generate(), media_type="text/plain")
